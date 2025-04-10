@@ -1,0 +1,109 @@
+stages:
+  - build
+  - quality_gate
+  - sign
+  - prepare_release_info
+  - release
+
+workflow:
+  rules:
+    - if: '$CI_COMMIT_BRANCH == "development"'
+    - if: '$CI_COMMIT_BRANCH =~ /^release\//'
+    - when: never
+
+image: eclipse-temurin:17-jdk-jammy
+
+.setup-build-deps:
+  before_script:
+    - apt-get --quiet update --yes
+    - apt-get --quiet install --yes wget unzip
+    - export ANDROID_HOME="${PWD}/android-sdk-root"
+    - install -d $ANDROID_HOME
+    - wget --no-verbose --output-document=$ANDROID_HOME/cmdline-tools.zip https://dl.google.com/android/repository/commandlinetools-linux-${ANDROID_SDK_TOOLS}_latest.zip
+    - unzip -q -d "$ANDROID_HOME/cmdline-tools" "$ANDROID_HOME/cmdline-tools.zip"
+    - mv -T "$ANDROID_HOME/cmdline-tools/cmdline-tools" "$ANDROID_HOME/cmdline-tools/tools"
+    - export PATH=$PATH:$ANDROID_HOME/cmdline-tools/latest/bin:$ANDROID_HOME/cmdline-tools/tools/bin
+    - yes | sdkmanager --licenses > /dev/null || true
+    - sdkmanager "platforms;android-${ANDROID_COMPILE_SDK}"
+    - sdkmanager "platform-tools"
+    - sdkmanager "build-tools;${ANDROID_BUILD_TOOLS}"
+
+build_app_debug:
+  stage: build
+  extends: .setup-build-deps
+  script:
+    - ./gradlew ${DEBUG_APP_BUILD}
+  artifacts:
+    paths:
+     - app/build
+  rules:
+    - if: '$CI_COMMIT_BRANCH == "development"'
+  
+build_app_release:
+  stage: build
+  extends: .setup-build-deps
+  script:
+    - ./gradlew  ${RELEASE_APP_BUILD}
+  artifacts:
+    paths:
+     - app/build
+  rules:
+    - if: '$CI_COMMIT_BRANCH =~ /^release\//'
+
+sonarqube_analysis:
+  stage: quality_gate
+  image: sonarsource/sonar-scanner-cli:${SONAR_SCANNER_VER}
+  variables:
+    SONAR_USER_HOME: "${CI_PROJECT_DIR}/.sonar"
+    GIT_DEPTH: "0"
+  script:
+    - sonar-scanner -Dsonar.qualitygate.wait=true -Dsonar.projectKey=${CI_PROJECT_NAME} 
+        -Dsonar.host.url=$SONAR_HOST_URL -Dsonar.login=$SONAR_TOKEN 
+        -Dsonar.java.binaries=./app/build -Dsonar.sources=./app/src/main/java 
+  allow_failure: false
+  artifacts:
+    paths:
+     - app/build/outputs/apk
+    expire_in: 1 week
+
+sign_release_apk:
+  image: eclipse-temurin:17-jdk-jammy
+  stage: sign
+  before_script:
+    - apt-get update && apt-get install -y apksigner
+    - echo $KEYSTORE_FILE | base64 -d > release-key.jks
+  script:
+    - apksigner sign --ks release-key.jks --ks-key-alias $KEY_ALIAS --ks-pass pass:KEYSTORE_PASS --out app-release-signed.apk app/build/outputs/apk/release/app-release-unsigned.apk
+  artifacts:
+    paths:
+      - app-release-signed.apk
+    expire_in: 1 week
+  dependencies:
+    - build_app_release
+  rules:
+    - if: '$CI_COMMIT_BRANCH =~ /^release\//'
+
+release_information:
+  stage: prepare_release_info                                              
+  rules:
+    - if: '$CI_COMMIT_BRANCH =~ /^release\//'
+  script:
+    - echo "VERSION=${CI_COMMIT_BRANCH#release/}" >> release-info.env
+  artifacts:
+    reports:
+      dotenv: release-info.env
+
+create_release:
+  stage: release
+  image: registry.gitlab.com/gitlab-org/release-cli:latest
+  rules:
+    - if: '$CI_COMMIT_BRANCH =~ /^release\//'
+  needs:
+    - job: release_information
+      artifacts: true
+  script:
+    - echo "Creating release..."
+  release:
+    name: 'Release $VERSION'
+    description: 'Release $VERSION'
+    tag_name: '$VERSION'
