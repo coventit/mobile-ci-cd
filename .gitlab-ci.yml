@@ -1,4 +1,5 @@
 stages:
+  - tests
   - build
   - quality_gate
   - sign
@@ -32,6 +33,18 @@ image: eclipse-temurin:17-jdk-jammy
     - sdkmanager "platforms;android-${ANDROID_COMPILE_SDK}"
     - sdkmanager "platform-tools"
     - sdkmanager "build-tools;${ANDROID_BUILD_TOOLS}"
+
+unit_tests:
+  stage: tests
+  extends: .setup-build-deps
+  allow_failure: false
+  script:
+    - ./gradlew ${UNIT_TESTS}
+  artifacts:
+    paths:
+      - app/build/test-results/**/TEST-*.xml
+    reports:
+      junit: app/build/test-results/**/TEST-*.xml
 
 # build debug apk for tests and manual QA
 build_app_debug:
@@ -99,6 +112,9 @@ release_information:
   stage: prepare_release_info                                              
   rules:
     - if: '$CI_COMMIT_BRANCH =~ /^release\//'
+  needs:
+    - job: sign_release_apk
+      artifacts: true
   script:
     - echo "VERSION=${CI_COMMIT_BRANCH#release/}" >> release-info.env
   artifacts:
