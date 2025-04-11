@@ -13,21 +13,27 @@ workflow:
 
 image: eclipse-temurin:17-jdk-jammy
 
+# Download and install build dependencies for the android
 .setup-build-deps:
   before_script:
     - apt-get --quiet update --yes
     - apt-get --quiet install --yes wget unzip
+      # Set working directory for android sdk
     - export ANDROID_HOME="${PWD}/android-sdk-root"
     - install -d $ANDROID_HOME
+      # Download android cmd tools
     - wget --no-verbose --output-document=$ANDROID_HOME/cmdline-tools.zip https://dl.google.com/android/repository/commandlinetools-linux-${ANDROID_SDK_TOOLS}_latest.zip
     - unzip -q -d "$ANDROID_HOME/cmdline-tools" "$ANDROID_HOME/cmdline-tools.zip"
     - mv -T "$ANDROID_HOME/cmdline-tools/cmdline-tools" "$ANDROID_HOME/cmdline-tools/tools"
     - export PATH=$PATH:$ANDROID_HOME/cmdline-tools/latest/bin:$ANDROID_HOME/cmdline-tools/tools/bin
+      # Accept all Andoid SDK licenses
     - yes | sdkmanager --licenses > /dev/null || true
+      # Install needed vervions of Android SDK and build tools
     - sdkmanager "platforms;android-${ANDROID_COMPILE_SDK}"
     - sdkmanager "platform-tools"
     - sdkmanager "build-tools;${ANDROID_BUILD_TOOLS}"
 
+# build debug apk for tests and manual QA
 build_app_debug:
   stage: build
   extends: .setup-build-deps
@@ -38,7 +44,8 @@ build_app_debug:
      - app/build
   rules:
     - if: '$CI_COMMIT_BRANCH == "development"'
-  
+
+# build release apk for sign and release to play market  
 build_app_release:
   stage: build
   extends: .setup-build-deps
@@ -50,6 +57,7 @@ build_app_release:
   rules:
     - if: '$CI_COMMIT_BRANCH =~ /^release\//'
 
+# perform SAST analysis of the sources
 sonarqube_analysis:
   stage: quality_gate
   image: sonarsource/sonar-scanner-cli:${SONAR_SCANNER_VER}
@@ -57,32 +65,36 @@ sonarqube_analysis:
     SONAR_USER_HOME: "${CI_PROJECT_DIR}/.sonar"
     GIT_DEPTH: "0"
   script:
+      # perform analysis and wait for qualitygate check results
     - sonar-scanner -Dsonar.qualitygate.wait=true -Dsonar.projectKey=${CI_PROJECT_NAME} 
         -Dsonar.host.url=$SONAR_HOST_URL -Dsonar.login=$SONAR_TOKEN 
         -Dsonar.java.binaries=./app/build -Dsonar.sources=./app/src/main/java 
+  # Stop pipeline if SonarQube qualitygate check failed
   allow_failure: false
+  # publish artifacts if check was successful
   artifacts:
     paths:
      - app/build/outputs/apk
     expire_in: 1 week
 
+# Sign release apk before publishing to the Play Store
 sign_release_apk:
-  image: eclipse-temurin:17-jdk-jammy
   stage: sign
   before_script:
-    - apt-get update && apt-get install -y apksigner
+    - apt-get -qqy update && apt-get -qqy install -y apksigner 
+      # create keystore file from secret
     - echo $KEYSTORE_FILE | base64 -d > release-key.jks
   script:
-    - apksigner sign --ks release-key.jks --ks-key-alias $KEY_ALIAS --ks-pass pass:KEYSTORE_PASS --out app-release-signed.apk app/build/outputs/apk/release/app-release-unsigned.apk
+    - apksigner sign --ks release-key.jks --ks-key-alias $KEY_ALIAS --ks-pass pass:$KEYSTORE_PASS --out app-release-signed.apk app/build/outputs/apk/release/app-release-unsigned.apk
   artifacts:
     paths:
       - app-release-signed.apk
-    expire_in: 1 week
   dependencies:
     - build_app_release
   rules:
     - if: '$CI_COMMIT_BRANCH =~ /^release\//'
 
+# Prepare release information, get version from the branch name
 release_information:
   stage: prepare_release_info                                              
   rules:
@@ -90,16 +102,37 @@ release_information:
   script:
     - echo "VERSION=${CI_COMMIT_BRANCH#release/}" >> release-info.env
   artifacts:
+    paths:
+      - app-release-signed.apk
+    expire_in: 1 week
     reports:
       dotenv: release-info.env
+
+release_to_playmarket:
+  stage: release
+  image: ruby:3.4.2-slim
+  rules:
+    - if: '$CI_COMMIT_BRANCH =~ /^release\//'
+      when: manual
+  needs:
+    - job: release_information
+      artifacts: true
+  # build native fastlane extention
+  before_script:
+    - apt-get -qqy update && apt-get -qqy install build-essential
+    - gem install fastlane
+  script:
+    # release app to playmarket using 'release' lane
+    - fastlane release
 
 create_release:
   stage: release
   image: registry.gitlab.com/gitlab-org/release-cli:latest
   rules:
     - if: '$CI_COMMIT_BRANCH =~ /^release\//'
+      when: manual
   needs:
-    - job: release_information
+    - job: release_to_playmarket
       artifacts: true
   script:
     - echo "Creating release..."
